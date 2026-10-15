@@ -53,3 +53,43 @@ This bridge recreates several hardware-level Tandy functions in software:
 •	Hardware Repeat: If you map a key to [REPEAT] in the web config, holding that key will repeat the last character you typed.
 
 •	Shift Lock vs. Caps Lock: Standard Caps Lock only capitalizes letters. The Tandy [LOCK] key acts as a true Shift Lock, which forces the entire keyboard into a shifted state (capitalizing letters and turning numbers into symbols).
+
+## Famicom Family BASIC Keyboard Mode
+
+The bridge can also emulate the Nintendo Family BASIC keyboard (HVC-007) on the Famicom's 15-pin expansion port, so a BLE keyboard can be used with Family BASIC and other keyboard-aware Famicom software. Select **Target Machine: Famicom** in the Mappings tab of the web configurator.
+
+### Wiring
+
+The Famicom uses 5V logic and the ESP32 is **not** 5V tolerant, so you need level shifting:
+
+•	Famicom → ESP32 (OUT0/OUT1/OUT2): a resistor divider on each line (e.g. 10kΩ series + 20kΩ to GND) or a level shifter.
+
+•	ESP32 → Famicom (data lines): a 5V-powered 74AHCT125 / 74HCT245 buffer is recommended (a 3.3V signal is below the guaranteed HIGH level of 5V CMOS inputs).
+
+|ESP32 Pin	| Signal		| Famicom expansion pin	|
+|:---		|:---			|:---			|
+GPIO 18		| OUT0 (row reset)	| 12			|
+GPIO 19		| OUT1 (column select)	| 11			|
+GPIO 23		| OUT2 (keyboard enable)| 10			|
+GPIO 22		| $4017 D1		| 7			|
+GPIO 25		| $4017 D2		| 6			|
+GPIO 26		| $4017 D3		| 5			|
+GPIO 27		| $4017 D4		| 4			|
+GND		| GND			| 1			|
+5V / VIN	| +5V			| 15			|
+
+### Key mapping
+
+Keys are mapped by **position**, as if your keyboard were the Japanese Family BASIC keyboard: letters, digits, F1–F8, arrows, Enter, Space and Esc map directly, and the punctuation keys map to the key in the same spot (`[`→`@`, `]`→`[`, `\`→`]`, `'`→`:`, `=`→`^`, `` ` ``→`¥`). Shift symbols therefore follow the Japanese layout (e.g. Shift+2 is `"`).
+
+|Modern key		| Family BASIC key	|
+|:---			|:---			|
+Backspace / Delete	| DEL			|
+Insert			| INS			|
+Home			| CLR HOME		|
+Ctrl			| CTR			|
+Left Alt		| GRPH			|
+Right Alt		| KANA			|
+Pause or the [BREAK] key you configured | STOP	|
+
+Caps Lock, Shift Lock and Repeat are Tandy-only features; the Famicom handles key repeat itself.

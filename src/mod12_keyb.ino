@@ -3,12 +3,29 @@
 #include <Preferences.h> 
 #include <WiFi.h>          
 #include <WebServer.h>     
+#include "soc/gpio_reg.h"
 
 // --- TANDY HARDWARE PINS ---
 const int CLOCK_PIN = 16; 
 const int DATA_PIN = 17;
 const int BUSY_PIN = 21;  
 const int BOOT_BUTTON = 0; 
+
+// --- FAMICOM EXPANSION PORT PINS (Family BASIC keyboard emulation) ---
+// Inputs come from the Famicom ($4016 writes) and are 5V: level-shift them!
+const int FAMI_OUT0 = 18; // Port pin 12: reset row counter
+const int FAMI_OUT1 = 19; // Port pin 11: column select (row++ on high->low)
+const int FAMI_OUT2 = 23; // Port pin 10: keyboard enable
+// Outputs to the Famicom ($4017 bits 1-4). HIGH = key pressed (inverted by the console).
+const int FAMI_D1 = 22;   // Port pin 7
+const int FAMI_D2 = 25;   // Port pin 6
+const int FAMI_D3 = 26;   // Port pin 5
+const int FAMI_D4 = 27;   // Port pin 4
+
+// --- TARGET MACHINE ---
+const uint8_t TARGET_TANDY   = 0;
+const uint8_t TARGET_FAMICOM = 1;
+uint8_t targetMachine = TARGET_TANDY;
 
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 Preferences preferences; 
@@ -96,6 +113,13 @@ const char webpageHTML[] PROGMEM = R"rawliteral(
 
             <div id="keyTab" class="tab-content">
                 <p style="text-align:center;">*** SYSTEM CONFIGURATION ***</p>
+
+                <label>TARGET MACHINE:</label>
+                <select id="target" name="target">
+                    <option value="0">TANDY MODEL II/12/16</option>
+                    <option value="1">FAMICOM (FAMILY BASIC KEYBOARD)</option>
+                </select>
+                <p style="font-size:12px; font-weight:normal;">FAMICOM MODE: KEYS ARE MAPPED BY POSITION LIKE THE JAPANESE KEYBOARD. THE [BREAK] KEY BELOW SENDS [STOP]. CAPS, SHIFT LOCK AND REPEAT ARE TANDY ONLY.</p>
                 
                 <label style="display:flex; align-items:center; justify-content:center; gap:10px; margin-top:20px; font-size:16px; background:#fff; border:2px solid #000; padding:10px;">
                     <input type="checkbox" id="capsDef" name="caps_def" value="1" style="width:auto; margin:0; transform:scale(1.2);">
@@ -127,7 +151,7 @@ const char webpageHTML[] PROGMEM = R"rawliteral(
                     <option value="78">PAGE DOWN</option>
                 </select>
 
-                <label>TANDY [BREAK] KEY:</label>
+                <label>TANDY [BREAK] / FAMICOM [STOP] KEY:</label>
                 <select id="mapBreak" name="k_break">
                     <option value="66">F9</option>
                     <option value="67">F10</option>
@@ -188,6 +212,7 @@ const char webpageHTML[] PROGMEM = R"rawliteral(
             .then(data => {
                 document.getElementById('macInput').value = data.mac;
                 if(data.caps_def) document.getElementById('capsDef').checked = true;
+                if(data.target !== undefined) document.getElementById('target').value = data.target;
                 if(data.k_break !== undefined) document.getElementById('mapBreak').value = data.k_break;
                 if(data.k_hold !== undefined) document.getElementById('mapHold').value = data.k_hold;
                 if(data.k_esc !== undefined) document.getElementById('mapEsc').value = data.k_esc;
@@ -297,7 +322,163 @@ void sendTandyChar(uint8_t ascii_val) {
     delay(20); 
 }
 
+// =========================================================================
+// FAMICOM FAMILY BASIC KEYBOARD EMULATION
+// =========================================================================
+// The real keyboard is a CD4017 row counter (9 rows used, 10th is empty) and a
+// 1-of-2 column selector, read 4 bits at a time through $4017 bits 1-4.
+// We mirror that counter in a GPIO interrupt and drive the 4 data lines from a
+// key matrix that the BLE callback keeps up to date. The console waits ~50 CPU
+// cycles (~28us) after each column select, so ISR latency is not an issue.
+
+portMUX_TYPE famiMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t famiMatrix[9][2] = {{0}}; // bit0..3 = $4017 D1..D4, 1 = pressed
+volatile uint8_t famiRow = 0;
+volatile uint8_t famiCol = 0;
+volatile bool famiEnabled = false;
+volatile bool famiLastCol = false;
+DRAM_ATTR uint32_t famiPinMask[16]; // nibble -> GPIO bitmask of the lines to set HIGH
+
+// Matrix position: row (0-8), column (0-1), $4017 bit (1-4)
+#define FK(row, col, bit) (uint8_t)(((row) << 3) | ((col) << 2) | ((bit) - 1))
+const uint8_t FK_NONE = 0xFF;
+
+const uint8_t FK_LETTERS[26] = {
+    FK(6,0,4), FK(4,1,1), FK(5,1,2), FK(5,0,4), FK(6,1,3), FK(5,1,1), FK(4,0,3), // A-G
+    FK(4,0,4), FK(3,0,2), FK(3,0,4), FK(2,0,4), FK(2,0,3), FK(3,1,1), FK(3,1,2), // H-N
+    FK(2,0,2), FK(2,1,3), FK(7,0,3), FK(5,0,3), FK(6,0,3), FK(5,0,2), FK(3,0,3), // O-U
+    FK(4,1,2), FK(6,0,2), FK(6,1,1), FK(4,0,2), FK(6,1,2)                        // V-Z
+};
+const uint8_t FK_DIGITS[10] = { // 1-9, 0 (HID order)
+    FK(7,1,3), FK(7,1,4), FK(6,1,4), FK(5,1,4), FK(5,1,3),
+    FK(4,1,4), FK(4,1,3), FK(3,1,4), FK(3,1,3), FK(2,1,4)
+};
+const uint8_t FK_FKEYS[8] = { // F1-F8
+    FK(7,0,1), FK(6,0,1), FK(5,0,1), FK(4,0,1), FK(3,0,1), FK(2,0,1), FK(1,0,1), FK(0,0,1)
+};
+const uint8_t FK_STOP = FK(0,1,4), FK_KANA = FK(0,1,1), FK_RSHIFT = FK(0,1,2);
+const uint8_t FK_CTR = FK(7,0,4), FK_GRPH = FK(7,1,2), FK_LSHIFT = FK(7,1,1);
+
+// Positional mapping: each modern key acts like the key in the same spot on the
+// Japanese Family BASIC keyboard (e.g. US [ is @, US ' is :).
+uint8_t famiKeyForHID(uint8_t hid) {
+    if (hid >= 0x04 && hid <= 0x1D) return FK_LETTERS[hid - 0x04];
+    if (hid >= 0x1E && hid <= 0x27) return FK_DIGITS[hid - 0x1E];
+    if (hid >= 0x59 && hid <= 0x62) return FK_DIGITS[hid - 0x59];   // Keypad 1-9, 0
+    if (hid >= 0x3A && hid <= 0x41) return FK_FKEYS[hid - 0x3A];
+    if (hid == key_break) return FK_STOP;
+    switch (hid) {
+        case 0x28: case 0x58: return FK(0,0,2);   // Enter -> RETURN
+        case 0x29: return FK(7,0,2);              // Esc -> ESC
+        case 0x2A: case 0x4C: return FK(8,1,3);   // Backspace / Delete -> DEL
+        case 0x2C: return FK(8,1,2);              // Space
+        case 0x2D: case 0x56: return FK(1,1,3);   // - 
+        case 0x2E: return FK(1,1,4);              // = -> ^
+        case 0x2F: return FK(1,0,2);              // [ -> @
+        case 0x30: return FK(0,0,3);              // ] -> [
+        case 0x31: case 0x32: return FK(0,0,4);   // \ -> ]
+        case 0x33: return FK(1,0,4);              // ;
+        case 0x34: return FK(1,0,3);              // ' -> :
+        case 0x35: case 0x89: return FK(0,1,3);   // ` / Intl Yen -> YEN
+        case 0x36: return FK(2,1,2);              // ,
+        case 0x37: case 0x63: return FK(2,1,1);   // .
+        case 0x38: case 0x54: return FK(1,1,2);   // /
+        case 0x87: return FK(1,1,1);              // Intl Ro -> _
+        case 0x48: return FK_STOP;                // Pause -> STOP
+        case 0x49: return FK(8,1,4);              // Insert -> INS
+        case 0x4A: return FK(8,0,1);              // Home -> CLR HOME
+        case 0x4F: return FK(8,0,3);              // Right
+        case 0x50: return FK(8,0,4);              // Left
+        case 0x51: return FK(8,1,1);              // Down
+        case 0x52: return FK(8,0,2);              // Up
+    }
+    return FK_NONE;
+}
+
+// Put the currently selected row/column on the data lines. Call with famiMux held.
+static inline void IRAM_ATTR famiDrive() {
+    uint8_t nibble;
+    if (!famiEnabled)      nibble = 0x0F; // Matrix disabled: all lines high (reads as 0)
+    else if (famiRow >= 9) nibble = 0x00; // 10th row has no keys
+    else                   nibble = famiMatrix[famiRow][famiCol];
+    REG_WRITE(GPIO_OUT_W1TS_REG, famiPinMask[nibble]);
+    REG_WRITE(GPIO_OUT_W1TC_REG, famiPinMask[nibble ^ 0x0F]);
+}
+
+// Fires on any change of OUT0/OUT1/OUT2: mirrors the keyboard's CD4017 counter.
+void IRAM_ATTR famiStrobeISR() {
+    uint32_t in = REG_READ(GPIO_IN_REG);
+    bool reset = in & (1UL << FAMI_OUT0);
+    bool col   = in & (1UL << FAMI_OUT1);
+    portENTER_CRITICAL_ISR(&famiMux);
+    if (reset) famiRow = 0;
+    else if (famiLastCol && !col) famiRow = (famiRow + 1) % 10;
+    famiLastCol = col;
+    famiCol = col ? 1 : 0;
+    famiEnabled = in & (1UL << FAMI_OUT2);
+    famiDrive();
+    portEXIT_CRITICAL_ISR(&famiMux);
+}
+
+void famiSetMatrix(const uint8_t newMatrix[9][2]) {
+    portENTER_CRITICAL(&famiMux);
+    for (int r = 0; r < 9; r++) {
+        famiMatrix[r][0] = newMatrix[r][0];
+        famiMatrix[r][1] = newMatrix[r][1];
+    }
+    famiDrive();
+    portEXIT_CRITICAL(&famiMux);
+}
+
+void famiPress(uint8_t m[9][2], uint8_t fk) {
+    if (fk == FK_NONE) return;
+    m[fk >> 3][(fk >> 2) & 1] |= 1 << (fk & 3);
+}
+
+// The Famicom scans the whole matrix itself, so we just mirror what is held down.
+void famiApplyReport(const uint8_t* pData, size_t length) {
+    if (length < 3 || pData[2] == 0x01) return; // Phantom/rollover report: keep last state
+    uint8_t m[9][2] = {{0}};
+    uint8_t mods = pData[0];
+    if (mods & 0x02) famiPress(m, FK_LSHIFT);
+    if (mods & 0x20) famiPress(m, FK_RSHIFT);
+    if (mods & 0x11) famiPress(m, FK_CTR);   // Either Ctrl
+    if (mods & 0x04) famiPress(m, FK_GRPH);  // Left Alt
+    if (mods & 0x40) famiPress(m, FK_KANA);  // Right Alt
+    for (size_t i = 1; i < length; i++) {
+        if (pData[i] != 0x00) famiPress(m, famiKeyForHID(pData[i]));
+    }
+    famiSetMatrix(m);
+}
+
+void famiReleaseAll() {
+    uint8_t m[9][2] = {{0}};
+    famiSetMatrix(m);
+}
+
+void famiBegin() {
+    const int dataPins[4] = { FAMI_D1, FAMI_D2, FAMI_D3, FAMI_D4 };
+    for (int n = 0; n < 16; n++) {
+        famiPinMask[n] = 0;
+        for (int b = 0; b < 4; b++) if (n & (1 << b)) famiPinMask[n] |= 1UL << dataPins[b];
+    }
+    for (int b = 0; b < 4; b++) pinMode(dataPins[b], OUTPUT);
+    pinMode(FAMI_OUT0, INPUT);
+    pinMode(FAMI_OUT1, INPUT);
+    pinMode(FAMI_OUT2, INPUT);
+    famiStrobeISR(); // Sync with the current line levels
+    // Attached from setup() so the ISR runs on core 1, away from the BLE stack
+    attachInterrupt(FAMI_OUT0, famiStrobeISR, CHANGE);
+    attachInterrupt(FAMI_OUT1, famiStrobeISR, CHANGE);
+    attachInterrupt(FAMI_OUT2, famiStrobeISR, CHANGE);
+}
+
 void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+    if (targetMachine == TARGET_FAMICOM) {
+        famiApplyReport(pData, length);
+        return;
+    }
+
     static uint8_t lastReport[8] = {0}; 
     
     bool isPhysicalShifted = (pData[0] & 0x02) || (pData[0] & 0x20);
@@ -357,8 +538,16 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     }
 };
 
+class ClientCallbacks : public NimBLEClientCallbacks {
+    void onDisconnect(NimBLEClient* pClient, int reason) override {
+        // Don't leave keys stuck down on the Famicom
+        if (targetMachine == TARGET_FAMICOM) famiReleaseAll();
+    }
+};
+
 bool connectToKeyboard() {
     NimBLEClient* pClient = NimBLEDevice::createClient();
+    pClient->setClientCallbacks(new ClientCallbacks(), true);
     if (!pClient->connect(advDevice)) return false;
     pClient->secureConnection(); 
     delay(500); 
@@ -397,6 +586,7 @@ void setup() {
     String savedMAC = preferences.getString("mac", "c0:32:05:6a:61:5a");
     targetMAC = savedMAC.c_str();
     
+    targetMachine = preferences.getUChar("target", TARGET_TANDY);
     defaultCapsOn = preferences.getBool("caps_def", false);
     capsLockState = defaultCapsOn; 
     shiftLockState = false; 
@@ -439,6 +629,7 @@ void setup() {
 
         server.on("/get_settings", HTTP_GET, []() {
             String json = "{\"mac\":\"" + String(targetMAC.c_str()) + "\",";
+            json += "\"target\":" + String(targetMachine) + ",";
             json += "\"caps_def\":" + String(defaultCapsOn ? "true" : "false") + ",";
             json += "\"k_break\":" + String(key_break) + ",";
             json += "\"k_hold\":" + String(key_hold) + ",";
@@ -490,6 +681,7 @@ void setup() {
                 preferences.putString("mac", newMAC);
             }
             
+            if (server.hasArg("target")) preferences.putUChar("target", server.arg("target").toInt());
             preferences.putBool("caps_def", server.hasArg("caps_def"));
             
             if (server.hasArg("k_break")) preferences.putUChar("k_break", server.arg("k_break").toInt());
@@ -514,6 +706,11 @@ void setup() {
         Serial.println("\nNO BUTTON PRESSED. Loading Bluetooth Bridge...");
         Serial.print("Target Keyboard MAC is: ");
         Serial.println(targetMAC.c_str());
+
+        if (targetMachine == TARGET_FAMICOM) {
+            Serial.println("Target machine: Famicom (Family BASIC keyboard)");
+            famiBegin();
+        }
 
         NimBLEDevice::init("");
         NimBLEDevice::setSecurityAuth(true, true, true); 
