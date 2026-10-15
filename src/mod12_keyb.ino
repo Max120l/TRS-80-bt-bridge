@@ -11,20 +11,15 @@ const int DATA_PIN = 17;
 const int BUSY_PIN = 21;  
 const int BOOT_BUTTON = 0; 
 
-// --- FAMICOM EXPANSION PORT PINS (Family BASIC keyboard emulation) ---
-// Inputs come from the Famicom ($4016 writes) and are 5V: level-shift them!
-const int FAMI_OUT0 = 18; // Port pin 12: reset row counter
-const int FAMI_OUT1 = 19; // Port pin 11: column select (row++ on high->low)
-const int FAMI_OUT2 = 23; // Port pin 10: keyboard enable
-// Outputs to the Famicom ($4017 bits 1-4). HIGH = key pressed (inverted by the console).
-const int FAMI_D1 = 22;   // Port pin 7
-const int FAMI_D2 = 25;   // Port pin 6
-const int FAMI_D3 = 26;   // Port pin 5
-const int FAMI_D4 = 27;   // Port pin 4
+// --- NES CONTROLLER PORT 2 PINS (NES 64 C64 keyboard adapter) ---
+// The NES is 5V: level-shift both inputs and buffer the output!
+const int NES_LATCH = 18; // Port pin 3: OUT0, latch / frame start
+const int NES_CLK   = 19; // Port pin 2: CLK, pulses low once per $4017 read
+const int NES_DATA  = 22; // Port pin 4: D0, serial data to the NES
 
 // --- TARGET MACHINE ---
 const uint8_t TARGET_TANDY   = 0;
-const uint8_t TARGET_FAMICOM = 1;
+const uint8_t TARGET_NES64   = 1;
 uint8_t targetMachine = TARGET_TANDY;
 
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -117,9 +112,9 @@ const char webpageHTML[] PROGMEM = R"rawliteral(
                 <label>TARGET MACHINE:</label>
                 <select id="target" name="target">
                     <option value="0">TANDY MODEL II/12/16</option>
-                    <option value="1">FAMICOM (FAMILY BASIC KEYBOARD)</option>
+                    <option value="1">NES 64 (C64 KEYBOARD ON PORT 2)</option>
                 </select>
-                <p style="font-size:12px; font-weight:normal;">FAMICOM MODE: KEYS ARE MAPPED BY POSITION LIKE THE JAPANESE KEYBOARD. THE [BREAK] KEY BELOW SENDS [STOP]. CAPS, SHIFT LOCK AND REPEAT ARE TANDY ONLY.</p>
+                <p style="font-size:12px; font-weight:normal;">NES 64 MODE: KEYS FOLLOW THE PC KEYCAPS (SEE README). THE TANDY KEY MAPPINGS BELOW ARE NOT USED.</p>
                 
                 <label style="display:flex; align-items:center; justify-content:center; gap:10px; margin-top:20px; font-size:16px; background:#fff; border:2px solid #000; padding:10px;">
                     <input type="checkbox" id="capsDef" name="caps_def" value="1" style="width:auto; margin:0; transform:scale(1.2);">
@@ -151,7 +146,7 @@ const char webpageHTML[] PROGMEM = R"rawliteral(
                     <option value="78">PAGE DOWN</option>
                 </select>
 
-                <label>TANDY [BREAK] / FAMICOM [STOP] KEY:</label>
+                <label>TANDY [BREAK] KEY:</label>
                 <select id="mapBreak" name="k_break">
                     <option value="66">F9</option>
                     <option value="67">F10</option>
@@ -323,159 +318,255 @@ void sendTandyChar(uint8_t ascii_val) {
 }
 
 // =========================================================================
-// FAMICOM FAMILY BASIC KEYBOARD EMULATION
+// NES 64 ADAPTER: C64 KEYBOARD MATRIX ON NES CONTROLLER PORT 2
 // =========================================================================
-// The real keyboard is a CD4017 row counter (9 rows used, 10th is empty) and a
-// 1-of-2 column selector, read 4 bits at a time through $4017 bits 1-4.
-// We mirror that counter in a GPIO interrupt and drive the 4 data lines from a
-// key matrix that the BLE callback keeps up to date. The console waits ~50 CPU
-// cycles (~28us) after each column select, so ISR latency is not an issue.
+// The NES ROM pulses OUT0 (latch) high then low, then clocks 88 bits out of
+// D0, one per $4017 read. The packet is:
+//   bytes 0-1  signature $A5 $5A
+//   bytes 2-9  C64 matrix rows 0-7 (CIA 1 layout), 0 = pressed
+//   byte 10    bit 0 RESTORE, 0 = pressed; bits 1-7 always 1
+// Bits go out MSB first like the AVR SPI reference design, and the line is
+// driven complemented because the NES input buffer inverts D0. After 88 bits
+// we send 1s, like a stock pad after its 8 buttons.
+//
+// Instead of SPI slave hardware, two GPIO interrupts on core 1 (away from the
+// BLE stack) play the 4021 shift register: the latch reloads the packet, each
+// CLK rising edge shifts the next bit out. The ROM's read loop leaves ~9us per
+// bit and the ISR responds in ~2-3us.
 
-portMUX_TYPE famiMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint8_t famiMatrix[9][2] = {{0}}; // bit0..3 = $4017 D1..D4, 1 = pressed
-volatile uint8_t famiRow = 0;
-volatile uint8_t famiCol = 0;
-volatile bool famiEnabled = false;
-volatile bool famiLastCol = false;
-DRAM_ATTR uint32_t famiPinMask[16]; // nibble -> GPIO bitmask of the lines to set HIGH
+const int NES_PACKET_BYTES = 11;
+const int NES_PACKET_BITS  = NES_PACKET_BYTES * 8;
 
-// Matrix position: row (0-8), column (0-1), $4017 bit (1-4)
-#define FK(row, col, bit) (uint8_t)(((row) << 3) | ((col) << 2) | ((bit) - 1))
-const uint8_t FK_NONE = 0xFF;
+// Matrix position: row (0-7) * 8 + bit (0-7). RESTORE is not in the matrix.
+#define CK(row, bit) (uint8_t)((row) * 8 + (bit))
+const uint8_t C64_NONE    = 0xFF;
+const uint8_t C64_RESTORE = 0xFE;
 
-const uint8_t FK_LETTERS[26] = {
-    FK(6,0,4), FK(4,1,1), FK(5,1,2), FK(5,0,4), FK(6,1,3), FK(5,1,1), FK(4,0,3), // A-G
-    FK(4,0,4), FK(3,0,2), FK(3,0,4), FK(2,0,4), FK(2,0,3), FK(3,1,1), FK(3,1,2), // H-N
-    FK(2,0,2), FK(2,1,3), FK(7,0,3), FK(5,0,3), FK(6,0,3), FK(5,0,2), FK(3,0,3), // O-U
-    FK(4,1,2), FK(6,0,2), FK(6,1,1), FK(4,0,2), FK(6,1,2)                        // V-Z
+const uint8_t C64_DEL = CK(0,0), C64_RETURN = CK(0,1), C64_CRSR_RT = CK(0,2), C64_F7 = CK(0,3);
+const uint8_t C64_F1 = CK(0,4), C64_F3 = CK(0,5), C64_F5 = CK(0,6), C64_CRSR_DN = CK(0,7);
+const uint8_t C64_LSHIFT = CK(1,7), C64_RSHIFT = CK(6,4);
+const uint8_t C64_PLUS = CK(5,0), C64_MINUS = CK(5,3), C64_PERIOD = CK(5,4), C64_COLON = CK(5,5);
+const uint8_t C64_AT = CK(5,6), C64_COMMA = CK(5,7), C64_POUND = CK(6,0), C64_STAR = CK(6,1);
+const uint8_t C64_SEMI = CK(6,2), C64_HOME = CK(6,3), C64_EQUALS = CK(6,5), C64_UPARROW = CK(6,6);
+const uint8_t C64_SLASH = CK(6,7), C64_LEFTARROW = CK(7,1), C64_CTRL = CK(7,2), C64_SPACE = CK(7,4);
+const uint8_t C64_CBM = CK(7,5), C64_STOP = CK(7,7);
+
+const uint8_t C64_LETTERS[26] = {
+    CK(1,2), CK(3,4), CK(2,4), CK(2,2), CK(1,6), CK(2,5), CK(3,2), // A-G
+    CK(3,5), CK(4,1), CK(4,2), CK(4,5), CK(5,2), CK(4,4), CK(4,7), // H-N
+    CK(4,6), CK(5,1), CK(7,6), CK(2,1), CK(1,5), CK(2,6), CK(3,6), // O-U
+    CK(3,7), CK(1,1), CK(2,7), CK(3,1), CK(1,4)                    // V-Z
 };
-const uint8_t FK_DIGITS[10] = { // 1-9, 0 (HID order)
-    FK(7,1,3), FK(7,1,4), FK(6,1,4), FK(5,1,4), FK(5,1,3),
-    FK(4,1,4), FK(4,1,3), FK(3,1,4), FK(3,1,3), FK(2,1,4)
+const uint8_t C64_DIGITS[10] = { // 1-9, 0 (HID order)
+    CK(7,0), CK(7,3), CK(1,0), CK(1,3), CK(2,0), CK(2,3), CK(3,0), CK(3,3), CK(4,0), CK(4,3)
 };
-const uint8_t FK_FKEYS[8] = { // F1-F8
-    FK(7,0,1), FK(6,0,1), FK(5,0,1), FK(4,0,1), FK(3,0,1), FK(2,0,1), FK(1,0,1), FK(0,0,1)
-};
-const uint8_t FK_STOP = FK(0,1,4), FK_KANA = FK(0,1,1), FK_RSHIFT = FK(0,1,2);
-const uint8_t FK_CTR = FK(7,0,4), FK_GRPH = FK(7,1,2), FK_LSHIFT = FK(7,1,1);
 
-// Positional mapping: each modern key acts like the key in the same spot on the
-// Japanese Family BASIC keyboard (e.g. US [ is @, US ' is :).
-uint8_t famiKeyForHID(uint8_t hid) {
-    if (hid >= 0x04 && hid <= 0x1D) return FK_LETTERS[hid - 0x04];
-    if (hid >= 0x1E && hid <= 0x27) return FK_DIGITS[hid - 0x1E];
-    if (hid >= 0x59 && hid <= 0x62) return FK_DIGITS[hid - 0x59];   // Keypad 1-9, 0
-    if (hid >= 0x3A && hid <= 0x41) return FK_FKEYS[hid - 0x3A];
-    if (hid == key_break) return FK_STOP;
-    switch (hid) {
-        case 0x28: case 0x58: return FK(0,0,2);   // Enter -> RETURN
-        case 0x29: return FK(7,0,2);              // Esc -> ESC
-        case 0x2A: case 0x4C: return FK(8,1,3);   // Backspace / Delete -> DEL
-        case 0x2C: return FK(8,1,2);              // Space
-        case 0x2D: case 0x56: return FK(1,1,3);   // - 
-        case 0x2E: return FK(1,1,4);              // = -> ^
-        case 0x2F: return FK(1,0,2);              // [ -> @
-        case 0x30: return FK(0,0,3);              // ] -> [
-        case 0x31: case 0x32: return FK(0,0,4);   // \ -> ]
-        case 0x33: return FK(1,0,4);              // ;
-        case 0x34: return FK(1,0,3);              // ' -> :
-        case 0x35: case 0x89: return FK(0,1,3);   // ` / Intl Yen -> YEN
-        case 0x36: return FK(2,1,2);              // ,
-        case 0x37: case 0x63: return FK(2,1,1);   // .
-        case 0x38: case 0x54: return FK(1,1,2);   // /
-        case 0x87: return FK(1,1,1);              // Intl Ro -> _
-        case 0x48: return FK_STOP;                // Pause -> STOP
-        case 0x49: return FK(8,1,4);              // Insert -> INS
-        case 0x4A: return FK(8,0,1);              // Home -> CLR HOME
-        case 0x4F: return FK(8,0,3);              // Right
-        case 0x50: return FK(8,0,4);              // Left
-        case 0x51: return FK(8,1,1);              // Down
-        case 0x52: return FK(8,0,2);              // Up
+// What a key does to the C64 Shift lines while it is down
+const uint8_t SH_PASS = 0; // C64 Shift follows the PC Shift keys (and SHIFT LOCK)
+const uint8_t SH_ON   = 1; // Force C64 Left Shift down
+const uint8_t SH_OFF  = 2; // Force both C64 Shifts up
+
+struct C64KeyMap {
+    uint8_t hid;
+    uint8_t posKey;               // Used while C= or CTRL is held: positional, no Shift faking
+    uint8_t key,  mode;           // PC Shift up
+    uint8_t sKey, sMode;          // PC Shift down
+};
+bool c64LookupKey(uint8_t hid, C64KeyMap& out);
+
+// Symbolic layout: every symbol stays where the PC keycap prints it.
+// Letters, digits 1/3/4/5 and keys that agree on both machines pass Shift through.
+const C64KeyMap C64_KEYMAP[] = {
+    // Digits whose shifted symbol lives elsewhere on the C64
+    { 0x1F, CK(7,3),       CK(7,3),       SH_PASS, C64_AT,        SH_OFF  }, // 2  @
+    { 0x23, CK(2,3),       CK(2,3),       SH_PASS, C64_UPARROW,   SH_OFF  }, // 6  ^
+    { 0x24, CK(3,0),       CK(3,0),       SH_PASS, CK(2,3),       SH_ON   }, // 7  & = Shift+6
+    { 0x25, CK(3,3),       CK(3,3),       SH_PASS, C64_STAR,      SH_OFF  }, // 8  *
+    { 0x26, CK(4,0),       CK(4,0),       SH_PASS, CK(3,3),       SH_ON   }, // 9  ( = Shift+8
+    { 0x27, CK(4,3),       CK(4,3),       SH_PASS, CK(4,0),       SH_ON   }, // 0  ) = Shift+9
+    // Symbol keys
+    { 0x2D, C64_PLUS,      C64_MINUS,     SH_PASS, C64_LEFTARROW, SH_OFF  }, // -  _
+    { 0x2E, C64_MINUS,     C64_EQUALS,    SH_PASS, C64_PLUS,      SH_OFF  }, // =  +
+    { 0x2F, C64_AT,        C64_COLON,     SH_ON,   C64_COLON,     SH_ON   }, // [  {
+    { 0x30, C64_STAR,      C64_SEMI,      SH_ON,   C64_SEMI,      SH_ON   }, // ]  }
+    { 0x31, C64_POUND,     C64_POUND,     SH_PASS, C64_POUND,     SH_PASS }, // backslash  |
+    { 0x32, C64_POUND,     C64_POUND,     SH_PASS, C64_POUND,     SH_PASS }, // ISO # key, same as backslash
+    { 0x33, C64_COLON,     C64_SEMI,      SH_PASS, C64_COLON,     SH_OFF  }, // ;  :
+    { 0x34, C64_SEMI,      CK(3,0),       SH_ON,   CK(7,3),       SH_ON   }, // '  " = Shift+7, Shift+2
+    { 0x35, C64_LEFTARROW, C64_LEFTARROW, SH_PASS, C64_LEFTARROW, SH_PASS }, // `
+    { 0x36, C64_COMMA,     C64_COMMA,     SH_PASS, C64_COMMA,     SH_PASS }, // ,  <
+    { 0x37, C64_PERIOD,    C64_PERIOD,    SH_PASS, C64_PERIOD,    SH_PASS }, // .  >
+    { 0x38, C64_SLASH,     C64_SLASH,     SH_PASS, C64_SLASH,     SH_PASS }, // /  ?
+    // Special keys (one table, adjust to taste)
+    { 0x29, C64_STOP,      C64_STOP,      SH_PASS, C64_STOP,      SH_PASS }, // Esc -> RUN/STOP
+    { 0x4B, C64_RESTORE,   C64_RESTORE,   SH_PASS, C64_RESTORE,   SH_PASS }, // Page Up -> RESTORE
+    { 0x2B, C64_CTRL,      C64_CTRL,      SH_PASS, C64_CTRL,      SH_PASS }, // Tab -> CTRL
+    { 0x2A, C64_DEL,       C64_DEL,       SH_PASS, C64_DEL,       SH_PASS }, // Backspace -> INST/DEL
+    { 0x49, C64_DEL,       C64_DEL,       SH_ON,   C64_DEL,       SH_ON   }, // Insert -> Shift+INST/DEL
+    { 0x4A, C64_HOME,      C64_HOME,      SH_PASS, C64_HOME,      SH_PASS }, // Home -> CLR/HOME
+    { 0x52, C64_CRSR_DN,   C64_CRSR_DN,   SH_ON,   C64_CRSR_DN,   SH_ON   }, // Up
+    { 0x50, C64_CRSR_RT,   C64_CRSR_RT,   SH_ON,   C64_CRSR_RT,   SH_ON   }, // Left
+    { 0x51, C64_CRSR_DN,   C64_CRSR_DN,   SH_OFF,  C64_CRSR_DN,   SH_OFF  }, // Down
+    { 0x4F, C64_CRSR_RT,   C64_CRSR_RT,   SH_OFF,  C64_CRSR_RT,   SH_OFF  }, // Right
+    { 0x3A, C64_F1,        C64_F1,        SH_PASS, C64_F1,        SH_PASS }, // F1
+    { 0x3B, C64_F1,        C64_F1,        SH_ON,   C64_F1,        SH_ON   }, // F2 = Shift+F1
+    { 0x3C, C64_F3,        C64_F3,        SH_PASS, C64_F3,        SH_PASS }, // F3
+    { 0x3D, C64_F3,        C64_F3,        SH_ON,   C64_F3,        SH_ON   }, // F4 = Shift+F3
+    { 0x3E, C64_F5,        C64_F5,        SH_PASS, C64_F5,        SH_PASS }, // F5
+    { 0x3F, C64_F5,        C64_F5,        SH_ON,   C64_F5,        SH_ON   }, // F6 = Shift+F5
+    { 0x40, C64_F7,        C64_F7,        SH_PASS, C64_F7,        SH_PASS }, // F7
+    { 0x41, C64_F7,        C64_F7,        SH_ON,   C64_F7,        SH_ON   }, // F8 = Shift+F7
+    { 0x28, C64_RETURN,    C64_RETURN,    SH_PASS, C64_RETURN,    SH_PASS }, // Enter
+    { 0x58, C64_RETURN,    C64_RETURN,    SH_PASS, C64_RETURN,    SH_PASS }, // Keypad Enter
+    { 0x2C, C64_SPACE,     C64_SPACE,     SH_PASS, C64_SPACE,     SH_PASS }, // Space
+};
+const uint8_t HID_CAPS_LOCK = 0x39;
+const uint8_t HID_MOD_LCTRL = 0x01, HID_MOD_LSHIFT = 0x02, HID_MOD_RSHIFT = 0x20;
+
+// Look up a key; letters and plain digits are generated, the rest come from the table
+bool c64LookupKey(uint8_t hid, C64KeyMap& out) {
+    if (hid >= 0x04 && hid <= 0x1D) {
+        uint8_t k = C64_LETTERS[hid - 0x04];
+        out = { hid, k, k, SH_PASS, k, SH_PASS };
+        return true;
     }
-    return FK_NONE;
-}
-
-// Put the currently selected row/column on the data lines. Call with famiMux held.
-static inline void IRAM_ATTR famiDrive() {
-    uint8_t nibble;
-    if (!famiEnabled)      nibble = 0x0F; // Matrix disabled: all lines high (reads as 0)
-    else if (famiRow >= 9) nibble = 0x00; // 10th row has no keys
-    else                   nibble = famiMatrix[famiRow][famiCol];
-    REG_WRITE(GPIO_OUT_W1TS_REG, famiPinMask[nibble]);
-    REG_WRITE(GPIO_OUT_W1TC_REG, famiPinMask[nibble ^ 0x0F]);
-}
-
-// Fires on any change of OUT0/OUT1/OUT2: mirrors the keyboard's CD4017 counter.
-void IRAM_ATTR famiStrobeISR() {
-    uint32_t in = REG_READ(GPIO_IN_REG);
-    bool reset = in & (1UL << FAMI_OUT0);
-    bool col   = in & (1UL << FAMI_OUT1);
-    portENTER_CRITICAL_ISR(&famiMux);
-    if (reset) famiRow = 0;
-    else if (famiLastCol && !col) famiRow = (famiRow + 1) % 10;
-    famiLastCol = col;
-    famiCol = col ? 1 : 0;
-    famiEnabled = in & (1UL << FAMI_OUT2);
-    famiDrive();
-    portEXIT_CRITICAL_ISR(&famiMux);
-}
-
-void famiSetMatrix(const uint8_t newMatrix[9][2]) {
-    portENTER_CRITICAL(&famiMux);
-    for (int r = 0; r < 9; r++) {
-        famiMatrix[r][0] = newMatrix[r][0];
-        famiMatrix[r][1] = newMatrix[r][1];
+    for (const C64KeyMap& m : C64_KEYMAP) {
+        if (m.hid == hid) { out = m; return true; }
     }
-    famiDrive();
-    portEXIT_CRITICAL(&famiMux);
+    if (hid >= 0x1E && hid <= 0x27) { // 1, 3, 4, 5: same symbols on both machines
+        uint8_t k = C64_DIGITS[hid - 0x1E];
+        out = { hid, k, k, SH_PASS, k, SH_PASS };
+        return true;
+    }
+    return false;
 }
 
-void famiPress(uint8_t m[9][2], uint8_t fk) {
-    if (fk == FK_NONE) return;
-    m[fk >> 3][(fk >> 2) & 1] |= 1 << (fk & 3);
+// Double-buffered packet: the BLE side builds into the spare and swaps the
+// pointer, the latch ISR copies the current one, so a packet never mixes states.
+uint8_t nesPacketBuf[2][NES_PACKET_BYTES];
+volatile uint8_t* volatile nesPacketReady = nesPacketBuf[0];
+DRAM_ATTR uint8_t nesTxBuf[NES_PACKET_BYTES];
+DRAM_ATTR volatile uint8_t nesBitIndex = NES_PACKET_BITS;
+
+// BLE-side key state
+uint8_t c64HeldKeys[6];       // PC keys down, oldest press first
+uint8_t c64HeldCount = 0;
+bool c64ShiftLock = false;
+
+static inline void IRAM_ATTR nesDriveBit() {
+    uint8_t idx = nesBitIndex;
+    bool bit = (idx >= NES_PACKET_BITS) ? 1 : (nesTxBuf[idx >> 3] >> (7 - (idx & 7))) & 1;
+    // The NES inverts D0: drive the line LOW to send a logical 1
+    if (bit) REG_WRITE(GPIO_OUT_W1TC_REG, 1UL << NES_DATA);
+    else     REG_WRITE(GPIO_OUT_W1TS_REG, 1UL << NES_DATA);
 }
 
-// The Famicom scans the whole matrix itself, so we just mirror what is held down.
-void famiApplyReport(const uint8_t* pData, size_t length) {
+// OUT0 high = latch: reload the packet and present its first bit
+void IRAM_ATTR nesLatchISR() {
+    if (!(REG_READ(GPIO_IN_REG) & (1UL << NES_LATCH))) return;
+    volatile uint8_t* src = nesPacketReady;
+    for (int i = 0; i < NES_PACKET_BYTES; i++) nesTxBuf[i] = src[i];
+    nesBitIndex = 0;
+    nesDriveBit();
+}
+
+// CLK rising edge = end of a $4017 read: shift out the next bit
+void IRAM_ATTR nesClockISR() {
+    if (REG_READ(GPIO_IN_REG) & (1UL << NES_LATCH)) return; // Still latching: hold bit 0
+    if (nesBitIndex < NES_PACKET_BITS) nesBitIndex = nesBitIndex + 1;
+    nesDriveBit();
+}
+
+void nesPublishMatrix(const uint8_t rows[8], bool restore) {
+    uint8_t* spare = (nesPacketReady == nesPacketBuf[0]) ? nesPacketBuf[1] : nesPacketBuf[0];
+    spare[0] = 0xA5;
+    spare[1] = 0x5A;
+    for (int r = 0; r < 8; r++) spare[2 + r] = rows[r];
+    spare[10] = restore ? 0xFE : 0xFF;
+    nesPacketReady = spare;
+}
+
+static inline void c64Press(uint8_t rows[8], uint8_t key) {
+    if (key < 64) rows[key >> 3] &= ~(1 << (key & 7));
+}
+
+// Rebuild the whole C64 state from the PC keys that are down
+void c64Rebuild(uint8_t mods) {
+    uint8_t rows[8];
+    memset(rows, 0xFF, sizeof(rows));
+    bool restore = false;
+    bool pcShift = mods & (HID_MOD_LSHIFT | HID_MOD_RSHIFT);
+    bool cbm = mods & HID_MOD_LCTRL;
+    bool ctrl = false;
+    for (int i = 0; i < c64HeldCount; i++) if (c64HeldKeys[i] == 0x2B) ctrl = true;
+    bool positional = cbm || ctrl;
+
+    bool lShift = (mods & HID_MOD_LSHIFT) || c64ShiftLock;
+    bool rShift = mods & HID_MOD_RSHIFT;
+    uint8_t shiftOverride = SH_PASS; // Most recent key with a Shift need wins
+
+    if (cbm) c64Press(rows, C64_CBM);
+    for (int i = 0; i < c64HeldCount; i++) {
+        C64KeyMap m;
+        if (!c64LookupKey(c64HeldKeys[i], m)) continue;
+        uint8_t key = positional ? m.posKey : (pcShift ? m.sKey : m.key);
+        uint8_t mode = positional ? SH_PASS : (pcShift ? m.sMode : m.mode);
+        if (key == C64_RESTORE) restore = true;
+        else c64Press(rows, key);
+        if (mode != SH_PASS) shiftOverride = mode;
+    }
+
+    if (shiftOverride == SH_ON) lShift = true;
+    if (shiftOverride == SH_OFF) lShift = rShift = false;
+    if (lShift) c64Press(rows, C64_LSHIFT);
+    if (rShift) c64Press(rows, C64_RSHIFT);
+    nesPublishMatrix(rows, restore);
+}
+
+void c64ApplyReport(const uint8_t* pData, size_t length) {
     if (length < 3 || pData[2] == 0x01) return; // Phantom/rollover report: keep last state
-    uint8_t m[9][2] = {{0}};
-    uint8_t mods = pData[0];
-    if (mods & 0x02) famiPress(m, FK_LSHIFT);
-    if (mods & 0x20) famiPress(m, FK_RSHIFT);
-    if (mods & 0x11) famiPress(m, FK_CTR);   // Either Ctrl
-    if (mods & 0x04) famiPress(m, FK_GRPH);  // Left Alt
-    if (mods & 0x40) famiPress(m, FK_KANA);  // Right Alt
-    for (size_t i = 1; i < length; i++) {
-        if (pData[i] != 0x00) famiPress(m, famiKeyForHID(pData[i]));
+
+    // Keep press order: keys still down stay in place, new presses go to the end
+    uint8_t next[6];
+    uint8_t count = 0;
+    for (int i = 0; i < c64HeldCount; i++) {
+        for (size_t j = 1; j < length; j++) {
+            if (pData[j] == c64HeldKeys[i]) { next[count++] = c64HeldKeys[i]; break; }
+        }
     }
-    famiSetMatrix(m);
+    for (size_t j = 1; j < length && count < 6; j++) {
+        uint8_t k = pData[j];
+        if (k == 0x00) continue;
+        bool known = false;
+        for (int i = 0; i < count; i++) if (next[i] == k) { known = true; break; }
+        if (known) continue;
+        next[count++] = k;
+        if (k == HID_CAPS_LOCK) c64ShiftLock = !c64ShiftLock; // SHIFT LOCK toggles on press
+    }
+    memcpy(c64HeldKeys, next, count);
+    c64HeldCount = count;
+    c64Rebuild(pData[0]);
 }
 
-void famiReleaseAll() {
-    uint8_t m[9][2] = {{0}};
-    famiSetMatrix(m);
+void c64ReleaseAll() {
+    c64HeldCount = 0;
+    c64Rebuild(0); // SHIFT LOCK stays as it was
 }
 
-void famiBegin() {
-    const int dataPins[4] = { FAMI_D1, FAMI_D2, FAMI_D3, FAMI_D4 };
-    for (int n = 0; n < 16; n++) {
-        famiPinMask[n] = 0;
-        for (int b = 0; b < 4; b++) if (n & (1 << b)) famiPinMask[n] |= 1UL << dataPins[b];
-    }
-    for (int b = 0; b < 4; b++) pinMode(dataPins[b], OUTPUT);
-    pinMode(FAMI_OUT0, INPUT);
-    pinMode(FAMI_OUT1, INPUT);
-    pinMode(FAMI_OUT2, INPUT);
-    famiStrobeISR(); // Sync with the current line levels
-    // Attached from setup() so the ISR runs on core 1, away from the BLE stack
-    attachInterrupt(FAMI_OUT0, famiStrobeISR, CHANGE);
-    attachInterrupt(FAMI_OUT1, famiStrobeISR, CHANGE);
-    attachInterrupt(FAMI_OUT2, famiStrobeISR, CHANGE);
+void nesBegin() {
+    c64ReleaseAll();
+    pinMode(NES_DATA, OUTPUT);
+    pinMode(NES_LATCH, INPUT);
+    pinMode(NES_CLK, INPUT);
+    nesDriveBit(); // Idle: send 1s until the first latch
+    // Attached from setup() so the ISRs run on core 1, away from the BLE stack
+    attachInterrupt(NES_LATCH, nesLatchISR, RISING);
+    attachInterrupt(NES_CLK, nesClockISR, RISING);
 }
 
 void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-    if (targetMachine == TARGET_FAMICOM) {
-        famiApplyReport(pData, length);
+    if (targetMachine == TARGET_NES64) {
+        c64ApplyReport(pData, length);
         return;
     }
 
@@ -540,8 +631,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 
 class ClientCallbacks : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pClient, int reason) override {
-        // Don't leave keys stuck down on the Famicom
-        if (targetMachine == TARGET_FAMICOM) famiReleaseAll();
+        // Don't leave keys stuck down on the NES
+        if (targetMachine == TARGET_NES64) c64ReleaseAll();
     }
 };
 
@@ -707,9 +798,9 @@ void setup() {
         Serial.print("Target Keyboard MAC is: ");
         Serial.println(targetMAC.c_str());
 
-        if (targetMachine == TARGET_FAMICOM) {
-            Serial.println("Target machine: Famicom (Family BASIC keyboard)");
-            famiBegin();
+        if (targetMachine == TARGET_NES64) {
+            Serial.println("Target machine: NES 64 (C64 keyboard on controller port 2)");
+            nesBegin();
         }
 
         NimBLEDevice::init("");

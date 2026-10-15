@@ -54,42 +54,42 @@ This bridge recreates several hardware-level Tandy functions in software:
 
 •	Shift Lock vs. Caps Lock: Standard Caps Lock only capitalizes letters. The Tandy [LOCK] key acts as a true Shift Lock, which forces the entire keyboard into a shifted state (capitalizing letters and turning numbers into symbols).
 
-## Famicom Family BASIC Keyboard Mode
+## NES 64 Mode (C64 keyboard on NES controller port 2)
 
-The bridge can also emulate the Nintendo Family BASIC keyboard (HVC-007) on the Famicom's 15-pin expansion port, so a BLE keyboard can be used with Family BASIC and other keyboard-aware Famicom software. Select **Target Machine: Famicom** in the Mappings tab of the web configurator.
+The bridge can act as the keyboard adapter for the NES 64 ROM (`nes64_c64kb.nes`): it presents a Commodore 64 keyboard matrix to a stock NES through controller port 2, using your BLE keyboard. A normal controller stays in port 1. Select **Target Machine: NES 64** in the Mappings tab of the web configurator. Full protocol and design notes are in [docs/NES64_ADAPTER.md](docs/NES64_ADAPTER.md).
 
 ### Wiring
 
-The Famicom uses 5V logic and the ESP32 is **not** 5V tolerant, so you need level shifting:
+The NES uses 5V logic and the ESP32 is **not** 5V tolerant:
 
-•	Famicom → ESP32 (OUT0/OUT1/OUT2): a resistor divider on each line (e.g. 10kΩ series + 20kΩ to GND) or a level shifter.
+•	NES → ESP32 (OUT0, CLK): a resistor divider on each line (e.g. 10kΩ series + 20kΩ to GND), or a 3.3V-powered 74LVC125 (5V-tolerant inputs).
 
-•	ESP32 → Famicom (data lines): a 5V-powered 74AHCT125 / 74HCT245 buffer is recommended (a 3.3V signal is below the guaranteed HIGH level of 5V CMOS inputs).
+•	ESP32 → NES (D0): a 5V-powered 74AHCT125 buffer (non-inverting).
 
-|ESP32 Pin	| Signal		| Famicom expansion pin	|
-|:---		|:---			|:---			|
-GPIO 18		| OUT0 (row reset)	| 12			|
-GPIO 19		| OUT1 (column select)	| 11			|
-GPIO 23		| OUT2 (keyboard enable)| 10			|
-GPIO 22		| $4017 D1		| 7			|
-GPIO 25		| $4017 D2		| 6			|
-GPIO 26		| $4017 D3		| 5			|
-GPIO 27		| $4017 D4		| 4			|
-GND		| GND			| 1			|
-5V / VIN	| +5V			| 15			|
+|ESP32 Pin	| Signal			| NES controller port 2 pin	|
+|:---		|:---				|:---				|
+GPIO 18		| OUT0 (latch)			| 3				|
+GPIO 19		| CLK				| 2				|
+GPIO 22		| D0 (data to NES)		| 4				|
+GND		| GND				| 1				|
+5V / VIN	| +5V				| 7				|
+
+Pin numbers follow the NESdev wiki; other sources number them differently. Check with a meter on a real extension cable before soldering. The ESP32 draws more than a pad (up to ~250 mA with Bluetooth active), so don't plug USB in while it's on the NES unless you cut the 5V lead.
 
 ### Key mapping
 
-Keys are mapped by **position**, as if your keyboard were the Japanese Family BASIC keyboard: letters, digits, F1–F8, arrows, Enter, Space and Esc map directly, and the punctuation keys map to the key in the same spot (`[`→`@`, `]`→`[`, `\`→`]`, `'`→`:`, `=`→`^`, `` ` ``→`¥`). Shift symbols therefore follow the Japanese layout (e.g. Shift+2 is `"`).
+Symbols stay where the PC keycap prints them: Shift+2 types `@`, Shift+; types `:`, `'` types an apostrophe. The bridge fakes the C64 Shift state to make that work. Letters pass Shift through, so Shift+letter still gives the C64 graphics. While C= (Left Ctrl) or CTRL (Tab) is held, symbol keys map by position with no Shift faking, so every C= and CTRL graphic can be reached.
 
-|Modern key		| Family BASIC key	|
-|:---			|:---			|
-Backspace / Delete	| DEL			|
-Insert			| INS			|
-Home			| CLR HOME		|
-Ctrl			| CTR			|
-Left Alt		| GRPH			|
-Right Alt		| KANA			|
-Pause or the [BREAK] key you configured | STOP	|
-
-Caps Lock, Shift Lock and Repeat are Tandy-only features; the Famicom handles key repeat itself.
+|PC key			| C64 key			|
+|:---			|:---				|
+Esc			| RUN/STOP			|
+Page Up			| RESTORE			|
+Left Ctrl		| C=				|
+Tab			| CTRL				|
+Caps Lock		| SHIFT LOCK (toggle)		|
+Backspace / Insert	| INST/DEL / Shift+INST/DEL	|
+Home			| CLR/HOME			|
+Arrows			| CRSR keys (Up/Left add Shift)	|
+F1–F8			| F1/F3/F5/F7, even keys add Shift |
+`\`			| £				|
+`` ` ``			| ←				|
